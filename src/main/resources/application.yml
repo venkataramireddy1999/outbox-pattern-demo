@@ -1,0 +1,27 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/outbox_demo}
+    username: ${DB_USERNAME:outbox}
+    password: ${DB_PASSWORD:outbox}
+  jpa:
+    hibernate:
+      ddl-auto: update # Demo only; use Flyway/Liquibase migrations in production.
+    open-in-view: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+
+app:
+  kafka:
+    order-topic: order-events
+  outbox:
+    poll-interval-ms: 3000
+
+server:
+  port: 8080
