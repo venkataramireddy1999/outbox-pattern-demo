@@ -1,65 +1,53 @@
-﻿# Simple Polling Outbox Pattern
+﻿# Polling Outbox Pattern
 
-Spring Boot + PostgreSQL + Kafka. Run one application instance for this learning example.
+A simple example using Spring Boot, PostgreSQL, and Kafka.
 
-## Why an outbox?
+## The dual write problem
 
-Saving an order and sending to Kafka are separate writes. One can succeed while the other fails: this is the dual write problem.
+An order service needs to save an order and publish an `OrderCreated` event to Kafka. These are two independent writes:
 
-Instead, `OrderService` saves the order and an event in one database transaction. Both commit or both roll back. `OutboxPublisher` polls unpublished events, sends them to Kafka, and sets `published = true` after acknowledgement.
+- The database commits, but publishing fails: the order exists without an event.
+- Publishing succeeds, but the database rolls back: consumers receive an event for an order that does not exist.
+
+A normal database transaction cannot make a database write and a Kafka send atomic.
+
+## The outbox solution
+
+Instead of sending directly to Kafka, save the order and its event in an outbox table within the **same database transaction**. Both are saved, or both are rolled back.
+
+A background poller publishes the saved events later.
 
 ```text
-Create order -> save order + outbox row (same transaction)
-Poll outbox  -> send to Kafka -> mark published
+Create order
+    |
+    +-- Save order      }
+    +-- Save outbox row } Same database transaction
+
+Background poller
+    |
+    +-- Read unpublished events
+    +-- Send each event to Kafka
+    +-- Wait for Kafka acknowledgement
+    +-- Mark the event as published
 ```
 
-The code contains a commented `kafkaTemplate.send(...)` to show the direct publishing approach we avoid.
+## How this project implements it
 
-## Run
+1. **OrderService** saves the order and an `OutboxEvent` using `@Transactional`. JSON serialization failures are rethrown as an unchecked exception so the transaction rolls back.
+2. **OutboxEvent** stores the event ID, order ID, event type, JSON payload, and a `published` flag that starts as `false`.
+3. **OutboxEventRepository** fetches unpublished events with `findByPublishedFalse()`.
+4. **OutboxPublisher** uses `@Scheduled` to poll. It calls `kafkaTemplate.send(...).get()` to wait for acknowledgement before saving `published = true`.
 
-Requires Java 21, Maven 3.9+, and Docker Compose. Commands use Bash syntax.
+If sending fails, the database row remains unpublished and can be retried during a later poll. Order creation does not need to wait for Kafka.
 
-```bash
-docker compose up -d
-mvn spring-boot:run
-```
+## Why duplicates are possible
 
-Wait for PostgreSQL and Kafka to start before starting the app.
+Kafka may acknowledge an event just before the application crashes, leaving the database row unpublished. The next poll can send the same event again.
 
-```bash
-curl -X POST http://localhost:8080/api/orders \
-  -H 'Content-Type: application/json' \
-  -d '{"customerName":"Rami","amount":1499.00}'
-```
+This is **at-least-once delivery**. Consumers should use the stable `eventId` in the payload to avoid processing the same event twice.
 
-Read events:
+## Scope of this example
 
-```bash
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic order-events --from-beginning
-```
+This demo uses one publisher instance and loads all unpublished events. Batching, safe row claiming for multiple publishers, retry backoff, and cleanup are left out to keep the example simple. Strict event ordering is not guaranteed.
 
-Inspect the outbox:
-
-```bash
-docker compose exec postgres psql -U outbox -d outbox_demo \
-  -c 'SELECT id, event_type, published FROM outbox;'
-```
-
-Stop Kafka with `docker compose stop kafka`, then create an order. Its event stays unpublished until Kafka recovers. Restart Kafka with `docker compose start kafka`; the poller retries. Kafka timeouts can delay retries.
-
-## Keep in mind
-
-- This demo loads all unpublished events and uses one publisher. Larger systems need batching, safe row claiming, retry backoff, and cleanup.
-- A crash after sending but before marking published can cause duplicates. Consumers must handle them using the stable `eventId` in the payload.
-- The API confirms order creation, not Kafka delivery. Strict event ordering is not guaranteed.
-- Hibernate manages the demo schema. Use database migrations for real deployments.
-- This version uses the `outbox` table. If you ran the earlier version, its `outbox_events` table is no longer read; any pending events there are not migrated automatically.
-
-## Tests
-
-`mvn test` checks acknowledgement, retries, and interruption handling in the publisher. It does not run PostgreSQL or Kafka.
-
-## License
-
-MIT - see [LICENSE](LICENSE).
+The outbox makes the **order and event record atomic in the database**. Delivery to Kafka happens separately, after commit.
